@@ -54,6 +54,7 @@ func ResourceBigtableTable() *schema.Resource {
 
 		CustomizeDiff: customdiff.All(
 			tpgresource.DefaultProviderProject,
+			abpDiffFunc,
 		),
 		// ----------------------------------------------------------------------
 		// IMPORTANT: Do not add any additional ForceNew fields to this resource.
@@ -152,7 +153,7 @@ func ResourceBigtableTable() *schema.Resource {
 						},
 					},
 				},
-				Description: `Defines an automated backup policy for a table, specified by Retention Period and Frequency. To disable, set both Retention Period and Frequency to 0.`,
+				Description: `Defines an automated backup policy for a table, specified by Retention Period and Frequency. To _create_ a table with automated backup disabled, either omit this argument, or alternatively specify a policy with both Retention Period and Frequency to 0. To disable automated backup on an _existing_ table that has automated backup enabled, set both Retention Period and Frequency to 0. If not provided in the congiruation, the resource will _not_ be modified.`,
 			},
 		},
 		UseJSONNumber: true,
@@ -169,6 +170,30 @@ func typeDiffFunc(k, oldValue, newValue string, d *schema.ResourceData) bool {
 		panic(fmt.Sprintf("new error: %v", err))
 	}
 	return bigtable.Equal(old, new)
+}
+
+func abpDiffFunc(ctx context.Context, diff *schema.ResourceDiff, meta interface{}) error {
+	if !diff.HasChange("automated_backup_policy") {
+		return nil
+	}
+	old, new := diff.GetChange("automated_backup_policy")
+	oldAbpSet, ok := old.(*schema.Set)
+	if !ok {
+		panic(fmt.Sprintf("error parsing old automated backup policy: %v", old))
+	}
+	newAbpSet, ok := new.(*schema.Set)
+	if !ok {
+		panic(fmt.Sprintf("error parsing new automated backup policy: %v", new))
+	}
+	if oldAbpSet.Len() == 0 && newAbpSet.Len() > 0 {
+		newAbpMap := newAbpSet.List()[0].(map[string]interface{})
+		if newAbpMap["retention_period"] == "0" && newAbpMap["frequency"] == "0" {
+			// If the state contains nil ABP and configuration contains zero ABP, the two are equivalent
+			log.Printf("[DEBUG] Suppressing diff for automated backup policy: %v (this is equivalent to the current nil state)", newAbpMap)
+			diff.Clear("automated_backup_policy")
+		}
+	}
+	return nil
 }
 
 func resourceBigtableTableCreate(d *schema.ResourceData, meta interface{}) error {
@@ -237,9 +262,11 @@ func resourceBigtableTableCreate(d *schema.ResourceData, meta interface{}) error
 			if err != nil {
 				return fmt.Errorf("Error parsing automated backup policy frequency: %s", err)
 			}
-			tblConf.AutomatedBackupConfig = &bigtable.TableAutomatedBackupPolicy{
-				RetentionPeriod: abpRetentionPeriod,
-				Frequency:       abpFrequency,
+			if abpFrequency != 0 && abpRetentionPeriod != 0 { // if non-zero ABP
+				tblConf.AutomatedBackupConfig = &bigtable.TableAutomatedBackupPolicy{
+					RetentionPeriod: abpRetentionPeriod,
+					Frequency:       abpFrequency,
+				}
 			}
 		}
 	}
@@ -505,39 +532,39 @@ func resourceBigtableTableUpdate(d *schema.ResourceData, meta interface{}) error
 	if d.HasChange("automated_backup_policy") {
 		automatedBackupPolicyField := d.Get("automated_backup_policy").(*schema.Set)
 		automatedBackupPolicyElements := automatedBackupPolicyField.List()
-		if len(automatedBackupPolicyElements) == 0 {
-			return fmt.Errorf("Incomplete automated_backup_policy")
-		}
-		automatedBackupPolicy := automatedBackupPolicyElements[0].(map[string]interface{})
-		abp := bigtable.TableAutomatedBackupPolicy{}
+		// If the field is being removed, do not apply any changes
+		if len(automatedBackupPolicyElements) != 0 {
+			automatedBackupPolicy := automatedBackupPolicyElements[0].(map[string]interface{})
+			abp := bigtable.TableAutomatedBackupPolicy{}
 
-		abpRetentionPeriodField, retentionPeriodExists := automatedBackupPolicy["retention_period"]
-		if retentionPeriodExists && abpRetentionPeriodField != "" {
-			abpRetentionPeriod, err := ParseDuration(abpRetentionPeriodField.(string))
-			if err != nil {
-				return fmt.Errorf("Error parsing automated backup policy retention period: %s", err)
+			abpRetentionPeriodField, retentionPeriodExists := automatedBackupPolicy["retention_period"]
+			if retentionPeriodExists && abpRetentionPeriodField != "" {
+				abpRetentionPeriod, err := ParseDuration(abpRetentionPeriodField.(string))
+				if err != nil {
+					return fmt.Errorf("Error parsing automated backup policy retention period: %s", err)
+				}
+				abp.RetentionPeriod = abpRetentionPeriod
 			}
-			abp.RetentionPeriod = abpRetentionPeriod
-		}
 
-		abpFrequencyField, frequencyExists := automatedBackupPolicy["frequency"]
-		if frequencyExists && abpFrequencyField != "" {
-			abpFrequency, err := ParseDuration(abpFrequencyField.(string))
-			if err != nil {
-				return fmt.Errorf("Error parsing automated backup policy frequency: %s", err)
+			abpFrequencyField, frequencyExists := automatedBackupPolicy["frequency"]
+			if frequencyExists && abpFrequencyField != "" {
+				abpFrequency, err := ParseDuration(abpFrequencyField.(string))
+				if err != nil {
+					return fmt.Errorf("Error parsing automated backup policy frequency: %s", err)
+				}
+				abp.Frequency = abpFrequency
 			}
-			abp.Frequency = abpFrequency
-		}
 
-		if abp.RetentionPeriod != nil && abp.RetentionPeriod.(time.Duration) == 0 && abp.Frequency != nil && abp.Frequency.(time.Duration) == 0 {
-			// Disable Automated Backups
-			if err := c.UpdateTableDisableAutomatedBackupPolicy(ctxWithTimeout, name); err != nil {
-				return fmt.Errorf("Error disabling automated backup configuration on table %v: %s", name, err)
-			}
-		} else {
-			// Update Automated Backups config
-			if err := c.UpdateTableWithAutomatedBackupPolicy(ctxWithTimeout, name, abp); err != nil {
-				return fmt.Errorf("Error updating automated backup configuration on table %v: %s", name, err)
+			if abp.RetentionPeriod != nil && abp.RetentionPeriod.(time.Duration) == 0 && abp.Frequency != nil && abp.Frequency.(time.Duration) == 0 {
+				// Disable Automated Backups
+				if err := c.UpdateTableDisableAutomatedBackupPolicy(ctxWithTimeout, name); err != nil {
+					return fmt.Errorf("Error disabling automated backup configuration on table %v: %s", name, err)
+				}
+			} else {
+				// Update Automated Backups config
+				if err := c.UpdateTableWithAutomatedBackupPolicy(ctxWithTimeout, name, abp); err != nil {
+					return fmt.Errorf("Error updating automated backup configuration on table %v: %s", name, err)
+				}
 			}
 		}
 	}
