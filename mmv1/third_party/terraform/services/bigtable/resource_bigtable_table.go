@@ -153,7 +153,7 @@ func ResourceBigtableTable() *schema.Resource {
 						},
 					},
 				},
-				Description: `Defines an automated backup policy for a table, specified by Retention Period and Frequency. To _create_ a table with automated backup disabled, omit this argument. To disable automated backup on an _existing_ table that has automated backup enabled, set both Retention Period and Frequency to 0. If not provided in the congiruation, the policy will _not_ be modified.`,
+				Description: `Defines an automated backup policy for a table, specified by Retention Period and Frequency. To _create_ a table with automated backup disabled, omit this argument. To disable automated backup on an _existing_ table that has automated backup enabled, set both Retention Period and Frequency to 0. If this argument is not provided in the configuration on update, the resource's automated backup policy will _not_ be modified.`,
 			},
 		},
 		UseJSONNumber: true,
@@ -185,10 +185,10 @@ func abpDiffFunc(ctx context.Context, diff *schema.ResourceDiff, meta interface{
 	if !ok {
 		fmt.Errorf("error parsing new automated backup policy: %v", new)
 	}
-	if oldAbpSet.Len() == 0 && newAbpSet.Len() > 0 {
+	// If the state contains nil automated_backup_policy and configuration contains automated_backup_policy with zeros, the two are equivalent
+	if oldAbpSet.Len() == 0 && newAbpSet.Len() == 1 {
 		newAbpMap := newAbpSet.List()[0].(map[string]interface{})
 		if newAbpMap["retention_period"] == "0" && newAbpMap["frequency"] == "0" {
-			// If the state contains nil automated_backup_policy and configuration contains automated_backup_policy with zeros, the two are equivalent
 			log.Printf("[DEBUG] Suppressing diff for automated backup policy")
 			diff.Clear("automated_backup_policy")
 		}
@@ -262,9 +262,11 @@ func resourceBigtableTableCreate(d *schema.ResourceData, meta interface{}) error
 			if err != nil {
 				return fmt.Errorf("Error parsing automated backup policy frequency: %s", err)
 			}
-			tblConf.AutomatedBackupConfig = &bigtable.TableAutomatedBackupPolicy{
-				RetentionPeriod: abpRetentionPeriod,
-				Frequency:       abpFrequency,
+			if abpFrequency != 0 && abpRetentionPeriod != 0 { // if fields are zero this indicates disable-on-create
+				tblConf.AutomatedBackupConfig = &bigtable.TableAutomatedBackupPolicy{
+					RetentionPeriod: abpRetentionPeriod,
+					Frequency:       abpFrequency,
+				}
 			}
 		}
 	}
